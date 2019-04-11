@@ -491,13 +491,16 @@ def do_empty(dynamo, table_name):
     table_desc = table_data["Table"]
     table_attribute_definitions = table_desc["AttributeDefinitions"]
     table_key_schema = table_desc["KeySchema"]
+	table_billing_mode = table_desc["BillingModeSummary"]["BillingMode"]
     original_read_capacity = table_desc["ProvisionedThroughput"]["ReadCapacityUnits"]
     original_write_capacity = table_desc["ProvisionedThroughput"]["WriteCapacityUnits"]
     table_local_secondary_indexes = table_desc.get("LocalSecondaryIndexes")
     table_global_secondary_indexes = table_desc.get("GlobalSecondaryIndexes")
 
-    table_provisioned_throughput = {"ReadCapacityUnits": int(original_read_capacity),
-                                    "WriteCapacityUnits": int(original_write_capacity)}
+    table_provisioned_throughput = None
+    if table_billing_mode == "PROVISIONED":
+        table_provisioned_throughput = {"ReadCapacityUnits": int(original_read_capacity),
+                                        "WriteCapacityUnits": int(original_write_capacity)}
 
     logging.info("Deleting Table " + table_name)
 
@@ -508,8 +511,8 @@ def do_empty(dynamo, table_name):
     while True:
         try:
             dynamo.create_table(table_attribute_definitions, table_name, table_key_schema,
-                                table_provisioned_throughput, table_local_secondary_indexes,
-                                table_global_secondary_indexes)
+                                table_local_secondary_indexes, table_global_secondary_indexes,
+                                table_billing_mode, table_provisioned_throughput)
             break
         except boto.exception.JSONResponseError as e:
             if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
@@ -563,9 +566,10 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                     table_desc["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
                 original_write_capacity = \
                     table_desc["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"]
+                table_billing_mode = table_desc["Table"]["BillingModeSummary"]["BillingMode"]
 
                 # override table read capacity if specified
-                if read_capacity is not None and read_capacity != original_read_capacity:
+                if read_capacity is not None and read_capacity != original_read_capacity and table_billing_mode == "PROVISIONED":
                     update_provisioned_throughput(dynamo, table_name,
                                                   read_capacity, original_write_capacity)
 
@@ -600,7 +604,7 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
                         break
 
                 # revert back to original table read capacity if specified
-                if read_capacity is not None and read_capacity != original_read_capacity:
+                if read_capacity is not None and read_capacity != original_read_capacity and table_billing_mode == "PROVISIONED":
                     update_provisioned_throughput(dynamo,
                                                   table_name,
                                                   original_read_capacity,
@@ -641,6 +645,7 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
     original_write_capacity = table["ProvisionedThroughput"]["WriteCapacityUnits"]
     table_local_secondary_indexes = table.get("LocalSecondaryIndexes")
     table_global_secondary_indexes = table.get("GlobalSecondaryIndexes")
+    table_billing_mode = table_desc["BillingModeSummary"]["BillingMode"]
 
     # override table write capacity if specified, else use RESTORE_WRITE_CAPACITY if original
     # write capacity is lower
@@ -661,8 +666,10 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
                 gsi["ProvisionedThroughput"]["WriteCapacityUnits"] = int(write_capacity)
 
     # temp provisioned throughput for restore
-    table_provisioned_throughput = {"ReadCapacityUnits": int(original_read_capacity),
-                                    "WriteCapacityUnits": int(write_capacity)}
+    table_provisioned_throughput = None
+    if table_billing_mode == "PROVISIONED":
+        table_provisioned_throughput = {"ReadCapacityUnits": int(original_read_capacity),
+                                        "WriteCapacityUnits": int(write_capacity)}
 
     if not args.dataOnly:
 
@@ -671,9 +678,9 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
 
         while True:
             try:
-                dynamo.create_table(table_attribute_definitions, table_table_name, table_key_schema,
-                                    table_provisioned_throughput, table_local_secondary_indexes,
-                                    table_global_secondary_indexes)
+                dynamo.create_table(table_attribute_definitions, table_name, table_key_schema,
+                                    table_local_secondary_indexes, table_global_secondary_indexes,
+                                    table_billing_mode, table_provisioned_throughput)
                 break
             except boto.exception.JSONResponseError as e:
                 if e.body["__type"] == "com.amazonaws.dynamodb.v20120810#LimitExceededException":
@@ -691,7 +698,7 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
         wait_for_active_table(dynamo, destination_table, "created")
     else:
         # update provisioned capacity
-        if int(write_capacity) > original_write_capacity:
+        if int(write_capacity) > original_write_capacity and table_billing_mode == "PROVISIONED":
             update_provisioned_throughput(dynamo,
                                           destination_table,
                                           original_read_capacity,
@@ -733,7 +740,7 @@ def do_restore(dynamo, sleep_interval, source_table, destination_table, write_ca
 
         if not args.skipThroughputUpdate:
             # revert to original table write capacity if it has been modified
-            if int(write_capacity) != original_write_capacity:
+            if int(write_capacity) != original_write_capacity and table_billing_mode == "PROVISIONED":
                 update_provisioned_throughput(dynamo,
                                               destination_table,
                                               original_read_capacity,
@@ -833,12 +840,12 @@ def main():
                         "searches [optional]")
     parser.add_argument("--readCapacity",
                         help="Change the temp read capacity of the DynamoDB table to backup "
-                        "from [optional]")
+                        "from [ignored for on demand billing, optional]")
     parser.add_argument("-t", "--tag", help="Tag to use for identifying tables to back up.  "
                         "Mutually exclusive with srcTable.  Provided as KEY=VALUE")
     parser.add_argument("--writeCapacity",
                         help="Change the temp write capacity of the DynamoDB table to restore "
-                        "to [defaults to " + str(RESTORE_WRITE_CAPACITY) + ", optional]")
+                        "to [defaults to " + str(RESTORE_WRITE_CAPACITY) + ", ignored for on demand billing, optional]")
     parser.add_argument("--schemaOnly", action="store_true", default=False,
                         help="Backup or restore the schema only. Do not backup/restore data. "
                         "Can be used with both backup and restore modes. Cannot be used with "
