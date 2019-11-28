@@ -22,6 +22,7 @@ import time
 import re
 import zipfile
 import tarfile
+import datetime
 
 try:
     from queue import Queue
@@ -37,6 +38,9 @@ except ImportError:
 import botocore
 import boto3
 
+client_config = botocore.config.Config(
+    max_pool_connections=25,
+)
 
 JSON_INDENT = 2
 AWS_SLEEP_INTERVAL = 10  # seconds
@@ -55,6 +59,13 @@ CURRENT_WORKING_DIR = os.getcwd()
 DEFAULT_PREFIX_SEPARATOR = "-"
 MAX_NUMBER_BACKUP_WORKERS = 25
 METADATA_URL = "http://169.254.169.254/latest/meta-data/"
+
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime.datetime):
+            return o.isoformat()
+
+        return json.JSONEncoder.default(self, o)
 
 
 def _get_aws_client(profile, region, service):
@@ -83,9 +94,9 @@ def _get_aws_client(profile, region, service):
 
     if profile:
         session = boto3.Session(profile_name=profile)
-        client = session.client(service, region_name=aws_region)
+        client = session.client(service, region_name=aws_region, config=client_config)
     else:
-        client = boto3.client(service, region_name=aws_region)
+        client = boto3.client(service, region_name=aws_region, config=client_config)
     return client
 
 
@@ -488,7 +499,7 @@ def do_empty(dynamo, table_name):
 
     # get table schema
     logging.info("Fetching table schema for " + table_name)
-    table_data = dynamo.describe_table(table_name)
+    table_data = dynamo.describe_table(TableName=table_name)
 
     table_desc = table_data["Table"]
     table_attribute_definitions = table_desc["AttributeDefinitions"]
@@ -562,8 +573,8 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
             # get table schema
             logging.info("Dumping table schema for " + table_name)
             f = open(args.dumpPath + os.sep + table_name + os.sep + SCHEMA_FILE, "w+")
-            table_desc = dynamo.describe_table(table_name)
-            f.write(json.dumps(table_desc, indent=JSON_INDENT))
+            table_desc = dynamo.describe_table(TableName=table_name)
+            f.write(json.dumps(table_desc, indent=JSON_INDENT, cls=DateTimeEncoder))
             f.close()
 
             if not args.schemaOnly:
@@ -587,9 +598,12 @@ def do_backup(dynamo, read_capacity, tableQueue=None, srcTable=None):
 
                 while True:
                     try:
-                        scanned_table = dynamo.scan(table_name,
-                                                    exclusive_start_key=last_evaluated_key)
-                    except ProvisionedThroughputExceededException:
+                        kwargs = {'TableName': table_name,
+                                  'ExclusiveStartKey': last_evaluated_key
+                                 }
+                        filtered = dict(filter(lambda item: item[1] is not None, kwargs.items()))
+                        scanned_table = dynamo.scan(**filtered)
+                    except dynamo.exceptions.ProvisionedThroughputExceededException:
                         logging.error("EXCEEDED THROUGHPUT ON TABLE " +
                                       table_name + ".  BACKUP FOR IT IS USELESS.")
                         tableQueue.task_done()
@@ -890,15 +904,15 @@ def main():
                                 aws_secret_access_key=args.secretKey,
                                 host=args.host,
                                 port=int(args.port),
-                                is_secure=False)
+                                is_secure=False, config=client_config)
         sleep_interval = LOCAL_SLEEP_INTERVAL
     else:
         if not args.profile:
             conn = boto3.client(service_name="dynamodb", region_name=args.region, aws_access_key_id=args.accessKey,
-                                                    aws_secret_access_key=args.secretKey)
+                                                    aws_secret_access_key=args.secretKey, config=client_config)
             sleep_interval = AWS_SLEEP_INTERVAL
         else:
-            conn = boto3.client(service_name="dynamodb", region_name=args.region, profile_name=args.profile)
+            conn = boto3.client(service_name="dynamodb", region_name=args.region, profile_name=args.profile, config=client_config)
             sleep_interval = AWS_SLEEP_INTERVAL
 
     # don't proceed if connection is not established
